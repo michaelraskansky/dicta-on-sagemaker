@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Download DictaLM-3.0-24B-Thinking from HuggingFace and upload to S3
+
+Parameters:
+  S3Bucket:
+    Type: String
+    Description: S3 bucket for model artifacts
+
+Resources:
+  UploaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3Upload
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${S3Bucket}/dictalm-thinking-24b/*
+                  - !Sub arn:aws:s3:::${S3Bucket}
+        - PolicyName: SSMParameter
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/dictalm-thinking-upload/*
+
+  UploaderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref UploaderRole
+
+  DataVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      Size: 300
+      VolumeType: gp3
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: dictalm-thinking-data
+
+  UploaderInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: c5.4xlarge
+      IamInstanceProfile: !Ref UploaderInstanceProfile
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: dictalm-thinking-uploader
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          
+          aws ssm put-parameter --name "/dictalm-thinking-upload/status" --value "Starting" --type String --overwrite --region ${AWS::Region}
+          
+          while [ ! -e /dev/nvme1n1 ]; do sleep 1; done
+          mkfs -t ext4 /dev/nvme1n1
+          mkdir -p /data
+          mount /dev/nvme1n1 /data
+          
+          export HF_HOME=/data/huggingface
+          mkdir -p $HF_HOME
+          
+          yum install -y python3-pip git
+          pip3 install huggingface_hub
+          
+          aws ssm put-parameter --name "/dictalm-thinking-upload/status" --value "Downloading model" --type String --overwrite --region ${AWS::Region}
+          
+          python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='dicta-il/DictaLM-3.0-24B-Thinking', local_dir='/data/model')"
+          
+          cd /data/model
+          
+          echo "engine=Python" > serving.properties
+          echo "option.model_id=/opt/ml/model" >> serving.properties
+          echo "option.rolling_batch=vllm" >> serving.properties
+          echo "option.tensor_parallel_degree=4" >> serving.properties
+          echo "option.max_rolling_batch_size=32" >> serving.properties
+          echo "option.dtype=bf16" >> serving.properties
+          echo "option.trust_remote_code=true" >> serving.properties
+          
+          aws ssm put-parameter --name "/dictalm-thinking-upload/status" --value "Uploading to S3" --type String --overwrite --region ${AWS::Region}
+          
+          cd /data
+          tar czf model.tar.gz -C model .
+          aws s3 cp model.tar.gz s3://${S3Bucket}/dictalm-thinking-24b/model.tar.gz --region ${AWS::Region}
+          
+          aws ssm put-parameter --name "/dictalm-thinking-upload/status" --value "Complete" --type String --overwrite --region ${AWS::Region}
+          
+          shutdown -h now
+
+  VolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/sdf
+      InstanceId: !Ref UploaderInstance
+      VolumeId: !Ref DataVolume
+
+Outputs:
+  InstanceId:
+    Value: !Ref UploaderInstance
+  VolumeId:
+    Value: !Ref DataVolume

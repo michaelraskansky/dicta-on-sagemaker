@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Temporary EC2 instance to download DictaBERT model from HuggingFace,
+  package it with custom inference code, and upload to S3.
+  Instance auto-terminates after completion.
+
+Parameters:
+  S3Bucket:
+    Type: String
+    Description: S3 bucket for model artifacts
+
+Resources:
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3Upload
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${S3Bucket}/dictabert-menaked/*
+        - PolicyName: SSMParameter
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/dictabert-upload/*
+        - PolicyName: SelfTerminate
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:TerminateInstances
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/Name: dictabert-model-uploader
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Role]
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: t3.xlarge
+      IamInstanceProfile: !Ref InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -ex
+          
+          INSTANCE_ID=$(ec2-metadata -i | cut -d' ' -f2)
+          REGION=${AWS::Region}
+          
+          cleanup() {
+            aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region $REGION
+          }
+          trap cleanup EXIT
+          
+          # Install dependencies
+          dnf install -y python3-pip
+          pip3 install huggingface_hub
+          
+          cd /tmp
+          python3 << 'PYEOF'
+          from huggingface_hub import snapshot_download
+          import os
+
+          MODEL_ID = "dicta-il/dictabert-large-char-menaked"
+          MODEL_DIR = "/tmp/model"
+
+          snapshot_download(repo_id=MODEL_ID, local_dir=MODEL_DIR)
+
+          # Create code directory and inference script
+          os.makedirs(f"{MODEL_DIR}/code", exist_ok=True)
+          with open(f"{MODEL_DIR}/code/inference.py", "w") as f:
+              f.write('''"""Custom inference handler for DictaBERT model."""
+          from transformers import AutoModel, AutoTokenizer
+          import torch
+
+
+          def model_fn(model_dir):
+              """Load model and tokenizer from model directory."""
+              tokenizer = AutoTokenizer.from_pretrained(model_dir)
+              model = AutoModel.from_pretrained(model_dir, trust_remote_code=True)
+              model.eval()
+              if torch.cuda.is_available():
+                  model = model.cuda()
+              return {"model": model, "tokenizer": tokenizer}
+
+
+          def predict_fn(data, model_dict):
+              """Run inference using model's custom predict() method."""
+              sentences = data.get("inputs")
+              if isinstance(sentences, str):
+                  sentences = [sentences]
+              mark_matres = data.get("mark_matres_lectionis")
+              with torch.no_grad():
+                  return model_dict["model"].predict(
+                      sentences,
+                      model_dict["tokenizer"],
+                      mark_matres_lectionis=mark_matres
+                  )
+
+
+          def input_fn(request_body, request_content_type):
+              """Deserialize request body from JSON."""
+              import json
+              if request_content_type == "application/json":
+                  return json.loads(request_body)
+              raise ValueError(f"Unsupported content type: {request_content_type}")
+
+
+          def output_fn(prediction, accept):
+              """Serialize prediction to JSON."""
+              import json
+              return json.dumps(prediction), "application/json"
+          ''')
+          PYEOF
+          
+          # Create tarball and upload
+          tar czf model.tar.gz -C model .
+          aws s3 cp model.tar.gz s3://${S3Bucket}/dictabert-menaked/model.tar.gz
+          
+          # Signal completion
+          aws ssm put-parameter --name "/dictabert-upload/status" --value "complete" --type String --overwrite --region $REGION
+      Tags:
+        - Key: Name
+          Value: dictabert-model-uploader
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  ModelS3Path:
+    Value: !Sub s3://${S3Bucket}/dictabert-menaked/model.tar.gz

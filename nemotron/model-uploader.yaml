@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Download DictaLM-3.0-Nemotron-12B from HuggingFace and upload to S3
+
+Parameters:
+  S3Bucket:
+    Type: String
+    Description: S3 bucket for model artifacts
+
+Resources:
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3Upload
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:aws:s3:::${S3Bucket}/dictalm-nemotron-12b/*
+        - PolicyName: SSMParameter
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:PutParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/dictalm-upload/*
+        - PolicyName: SelfTerminate
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ec2:TerminateInstances
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/Name: dictalm-model-uploader
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Role]
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: m5.2xlarge
+      IamInstanceProfile: !Ref InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+        - DeviceName: /dev/xvdf
+          Ebs:
+            VolumeSize: 250
+            VolumeType: gp3
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -ex
+          
+          INSTANCE_ID=$(ec2-metadata -i | cut -d' ' -f2)
+          REGION=${AWS::Region}
+          
+          cleanup() {
+            aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region $REGION
+          }
+          trap cleanup EXIT
+          
+          # Mount data volume
+          mkfs -t xfs /dev/xvdf
+          mkdir /data
+          mount /dev/xvdf /data
+          
+          dnf install -y python3-pip
+          pip3 install huggingface_hub
+          
+          export HF_HOME=/data/hf_home
+          cd /data
+          python3 << 'PYEOF'
+          from huggingface_hub import snapshot_download
+          snapshot_download(repo_id="dicta-il/DictaLM-3.0-Nemotron-12B-Instruct", local_dir="/data/model")
+          PYEOF
+          
+          # Create serving.properties for DJL with vLLM backend
+          cat > /data/model/serving.properties << 'EOF'
+          engine=Python
+          option.rolling_batch=vllm
+          option.tensor_parallel_degree=4
+          option.dtype=bf16
+          option.trust_remote_code=true
+          option.max_model_len=4096
+          EOF
+          
+          tar czf model.tar.gz -C model .
+          aws s3 cp model.tar.gz s3://${S3Bucket}/dictalm-nemotron-12b/model.tar.gz
+          aws ssm put-parameter --name "/dictalm-upload/status" --value "complete" --type String --overwrite --region $REGION
+      Tags:
+        - Key: Name
+          Value: dictalm-model-uploader
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  ModelS3Path:
+    Value: !Sub s3://${S3Bucket}/dictalm-nemotron-12b/model.tar.gz

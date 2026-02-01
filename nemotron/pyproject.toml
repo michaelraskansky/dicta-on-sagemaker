@@ -1,0 +1,11 @@
+[project]
+name = "dictalm-sagemaker"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "sagemaker>=2.231.0,<3.0.0",
+    "boto3",
+]
+
+[project.optional-dependencies]
+dev = ["ipython"]
