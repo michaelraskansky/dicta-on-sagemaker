@@ -1,0 +1,20 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to source ECR...
+      - aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin 763104351884.dkr.ecr.eu-central-1.amazonaws.com
+      - echo Logging in to target ECR...
+      - aws ecr get-login-password --region il-central-1 | docker login --username AWS --password-stdin 509877531266.dkr.ecr.il-central-1.amazonaws.com
+  build:
+    commands:
+      - echo Pulling image from eu-central-1...
+      - docker pull 763104351884.dkr.ecr.eu-central-1.amazonaws.com/djl-inference:0.36.0-lmi18.0.0-cu128
+      - echo Tagging image for il-central-1...
+      - docker tag 763104351884.dkr.ecr.eu-central-1.amazonaws.com/djl-inference:0.36.0-lmi18.0.0-cu128 509877531266.dkr.ecr.il-central-1.amazonaws.com/djl-inference:0.36.0-lmi18.0.0-cu128
+      - echo Pushing image to il-central-1...
+      - docker push 509877531266.dkr.ecr.il-central-1.amazonaws.com/djl-inference:0.36.0-lmi18.0.0-cu128
+  post_build:
+    commands:
+      - echo Container copy completed successfully!
