@@ -1,0 +1,38 @@
+# Generated files
+lambda_function.zip
+*.pyc
+__pycache__/
+.DS_Store
+
+# Environment files
+.env
+.venv/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+.envrc
+infrastructure/memory_config.json
+infrastructure/gateway_config.json
+tasks/*.amazonq/cli-todo-lists/
+.amazonq/cli-todo-lists/*
+
+
+
+.bedrock_agentcore.yaml
+.dockerignore
+Dockerfile
+.backup
+.backup/*
+.tasks
+.tasks/*
+.pytest_cache
+.pytest_cache/*
+.research
+.research/.*
+.research/**/*

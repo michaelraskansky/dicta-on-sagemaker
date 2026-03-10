@@ -9,6 +9,7 @@ A collection of self-contained demos showing how to deploy and run things on AWS
 | [dicta-nikud](sagemaker/dicta-nikud/) | SageMaker | Deploy a Hebrew diacritization model (DictaBERT, 0.3B) to a real-time endpoint |
 | [dicta-thinking](sagemaker/dicta-thinking/) | SageMaker | Deploy a 24B reasoning model (DictaLM-3.0-Thinking) with DJL/vLLM |
 | [dicta-nemotron](sagemaker/dicta-nemotron/) | SageMaker | Deploy a 12B instruction model (DictaLM-3.0-Nemotron) with DJL/vLLM |
+| [genai-loft-demo](agentcore/genai-loft-demo/) | AgentCore | Bedrock AgentCore agents with memory, shared tools, and gateway |
 
 ## Structure
 
@@ -17,6 +18,8 @@ A collection of self-contained demos showing how to deploy and run things on AWS
 │   ├── dicta-nikud/        # BERT nikud model on HF container
 │   ├── dicta-thinking/     # 24B LLM on DJL/vLLM
 │   └── dicta-nemotron/     # 12B LLM on DJL/vLLM
+├── agentcore/
+│   └── genai-loft-demo/    # AgentCore agents workshop
 └── ...                     # more service categories as demos are added
 ```
 
