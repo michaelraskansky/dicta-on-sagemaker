@@ -14,7 +14,7 @@
 
 ### Setup (2 mins)
 ```bash
-cd /Users/michrask/Dev/genai-loft-demo-session31
+cd agentcore/genai-loft-demo
 code demo_01_basic_agent.py
 ```
 
