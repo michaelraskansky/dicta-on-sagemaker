@@ -1,0 +1,35 @@
+title = "gitleaks config for dicta monorepo"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "aws-account-id"
+description = "AWS Account ID (12 digits)"
+regex = '''(?i)(aws.?account.?id|account.?id)\s*[:=]\s*['"]?\d{12}['"]?'''
+tags = ["aws", "account"]
+
+[[rules]]
+id = "aws-arn-with-account"
+description = "Hardcoded AWS ARN with account ID"
+regex = '''arn:aws:[a-z0-9\-]+:[a-z0-9\-]*:\d{12}:[a-zA-Z0-9\-_/:.]+'''
+tags = ["aws", "arn"]
+
+[rules.allowlist]
+paths = [
+  '''infra/.*\.tf$''',
+  '''infra/.*\.asl\.json$''',
+]
+
+[[rules]]
+id = "aws-session-token"
+description = "AWS Session Token"
+regex = '''(?i)(aws.?session.?token)\s*[:=]\s*['"]?[A-Za-z0-9/+=]{100,}['"]?'''
+tags = ["aws", "token"]
+
+[allowlist]
+paths = [
+  '''\.terraform\.lock\.hcl$''',
+  '''package-lock\.json$''',
+  '''uv\.lock$''',
+]

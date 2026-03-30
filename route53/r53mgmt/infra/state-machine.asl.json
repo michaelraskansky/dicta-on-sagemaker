@@ -1,0 +1,294 @@
+{
+  "Comment": "DNSSEC KSK Rotation — Double-DS method per RFC 7583. Flow: CreateKmsKey → CreateKSK → WaitPropagation → GetDNSSEC → ExtractDS → AddBothDS (or manual via SNS) → WaitDsTtl → ValidateChain → RemoveOldDS (or manual) → WaitDsTtl → DeactivateOldKsk → WaitDnskeyTtl → DeleteOldKsk → ScheduleKmsDeletion → NotifySuccess. Manual steps use SNS publish.waitForTaskToken — the frontend /approve endpoint sends the callback.",
+  "StartAt": "CreateKmsKey",
+  "States": {
+
+    "CreateKmsKey": {
+      "Type": "Task",
+      "Resource": "${create_ksk_lambda_arn}",
+      "Parameters": {
+        "newKskName.$": "$.newKskName",
+        "accountId": "${account_id}"
+      },
+      "ResultPath": "$.newKsk",
+      "Comment": "Lambda creates KMS key with DNSSEC policy",
+      "Next": "CreateKeySigningKey"
+    },
+
+    "CreateKeySigningKey": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:route53:createKeySigningKey",
+      "Parameters": {
+        "HostedZoneId.$": "$.hostedZoneId",
+        "Name.$": "$.newKskName",
+        "KeyManagementServiceArn.$": "$.newKsk.kmsKeyArn",
+        "CallerReference.$": "States.Format('{}-{}', $.newKskName, $$.Execution.Name)",
+        "Status": "ACTIVE"
+      },
+      "ResultPath": "$.kskResult",
+      "Comment": "Create KSK — retries while KMS policy propagates to Route 53 (~2-10 min)",
+      "Retry": [{
+        "ErrorEquals": ["Route53.InvalidKMSArn", "Route53.InvalidKmsArnException"],
+        "IntervalSeconds": 15,
+        "BackoffRate": 1,
+        "MaxAttempts": 200
+      }],
+      "Next": "WaitForKskPropagation"
+    },
+
+    "WaitForKskPropagation": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Comment": "Wait for Route 53 to propagate new KSK to all authoritative servers",
+      "Next": "GetDnssecStatus"
+    },
+
+    "GetDnssecStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:route53:getDNSSEC",
+      "Parameters": { "HostedZoneId.$": "$.hostedZoneId" },
+      "ResultPath": "$.dnssecStatus",
+      "Next": "ExtractDsRecords"
+    },
+
+    "ExtractDsRecords": {
+      "Type": "Task",
+      "Resource": "${lambda_arn}",
+      "Parameters": {
+        "action": "extractDs",
+        "dnssecStatus.$": "$.dnssecStatus",
+        "oldKskName.$": "$.oldKskName",
+        "newKskName.$": "$.newKskName"
+      },
+      "ResultPath": "$.dsRecords",
+      "Next": "HasParentZone"
+    },
+
+    "HasParentZone": {
+      "Type": "Choice",
+      "Comment": "Check if parent zone is in our account (not null/absent = automated DS management)",
+      "Choices": [{
+        "And": [
+          { "Variable": "$.parentZoneId", "IsPresent": true },
+          { "Variable": "$.parentZoneId", "IsNull": false }
+        ],
+        "Next": "AddBothDsToParent"
+      }],
+      "Default": "NotifyManualDsAdd"
+    },
+
+    "AddBothDsToParent": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:route53:changeResourceRecordSets",
+      "Parameters": {
+        "HostedZoneId.$": "$.parentZoneId",
+        "ChangeBatch": {
+          "Comment.$": "States.Format('KSK rotation: add new DS for {}', $.zoneName)",
+          "Changes": [{
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+              "Name.$": "$.zoneName",
+              "Type": "DS",
+              "Ttl.$": "$.dsTtlSeconds",
+              "ResourceRecords": [
+                { "Value.$": "$.dsRecords.oldDs" },
+                { "Value.$": "$.dsRecords.newDs" }
+              ]
+            }
+          }]
+        }
+      },
+      "ResultPath": null,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 2, "BackoffRate": 2 }],
+      "Next": "WaitDsTtl"
+    },
+
+    "NotifyManualDsAdd": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish.waitForTaskToken",
+      "Parameters": {
+        "TopicArn": "${sns_topic_arn}",
+        "Subject.$": "States.Format('[DNSSEC] Action required: Add DS record for {}', $.zoneName)",
+        "Message.$": "States.Format('KSK rotation in progress for {}.\n\nPlease add DS record at registrar:\n{}\n\nKeep existing DS record as well.\n\nWhen done, approve in the r53mgmt UI or run:\naws stepfunctions send-task-success --task-token \"{}\" --task-output \"{{}}\"', $.zoneName, $.dsRecords.newDs, $$.Task.Token)"
+      },
+      "HeartbeatSeconds": 604800,
+      "ResultPath": null,
+      "Catch": [{
+        "ErrorEquals": ["States.Timeout"],
+        "ResultPath": "$.approvalError",
+        "Next": "NotifyValidationFailed"
+      }],
+      "Next": "WaitDsTtl"
+    },
+
+    "WaitDsTtl": {
+      "Type": "Wait",
+      "SecondsPath": "$.dsTtlWaitSeconds",
+      "Comment": "Wait 2× DS TTL for caches to learn about new DS",
+      "Next": "ValidateChain"
+    },
+
+    "ValidateChain": {
+      "Type": "Task",
+      "Resource": "${lambda_arn}",
+      "Parameters": {
+        "action": "validate",
+        "hostedZoneId.$": "$.hostedZoneId",
+        "zoneName.$": "$.zoneName",
+        "newKskName.$": "$.newKskName",
+        "parentZoneId.$": "$.parentZoneId"
+      },
+      "ResultPath": "$.validation",
+      "Retry": [{ "ErrorEquals": ["Lambda.ServiceException"], "MaxAttempts": 2, "BackoffRate": 2 }],
+      "Next": "IsChainValid"
+    },
+
+    "IsChainValid": {
+      "Type": "Choice",
+      "Choices": [{
+        "Variable": "$.validation.valid",
+        "BooleanEquals": true,
+        "Next": "HasParentZoneForDsRemoval"
+      }],
+      "Default": "NotifyValidationFailed"
+    },
+
+    "HasParentZoneForDsRemoval": {
+      "Type": "Choice",
+      "Choices": [{
+        "And": [
+          { "Variable": "$.parentZoneId", "IsPresent": true },
+          { "Variable": "$.parentZoneId", "IsNull": false }
+        ],
+        "Next": "RemoveOldDsFromParent"
+      }],
+      "Default": "NotifyManualDsRemove"
+    },
+
+    "RemoveOldDsFromParent": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:route53:changeResourceRecordSets",
+      "Parameters": {
+        "HostedZoneId.$": "$.parentZoneId",
+        "ChangeBatch": {
+          "Comment.$": "States.Format('KSK rotation: remove old DS for {}', $.zoneName)",
+          "Changes": [{
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+              "Name.$": "$.zoneName",
+              "Type": "DS",
+              "Ttl.$": "$.dsTtlSeconds",
+              "ResourceRecords": [
+                { "Value.$": "$.dsRecords.newDs" }
+              ]
+            }
+          }]
+        }
+      },
+      "ResultPath": null,
+      "Next": "WaitDsTtlForRemoval"
+    },
+
+    "NotifyManualDsRemove": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish.waitForTaskToken",
+      "Parameters": {
+        "TopicArn": "${sns_topic_arn}",
+        "Subject.$": "States.Format('[DNSSEC] Action required: Remove old DS for {}', $.zoneName)",
+        "Message.$": "States.Format('Validation passed for {}.\n\nRemove OLD DS from registrar:\n{}\n\nKeep only new DS:\n{}\n\nWhen done, approve in the r53mgmt UI or run:\naws stepfunctions send-task-success --task-token \"{}\" --task-output \"{{}}\"', $.zoneName, $.dsRecords.oldDs, $.dsRecords.newDs, $$.Task.Token)"
+      },
+      "HeartbeatSeconds": 604800,
+      "ResultPath": null,
+      "Catch": [{
+        "ErrorEquals": ["States.Timeout"],
+        "ResultPath": "$.approvalError",
+        "Next": "NotifyValidationFailed"
+      }],
+      "Next": "WaitDsTtlForRemoval"
+    },
+
+    "WaitDsTtlForRemoval": {
+      "Type": "Wait",
+      "SecondsPath": "$.dsTtlWaitSeconds",
+      "Comment": "Wait 2× DS TTL for caches to forget old DS",
+      "Next": "DeactivateOldKsk"
+    },
+
+    "DeactivateOldKsk": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:route53:deactivateKeySigningKey",
+      "Parameters": {
+        "HostedZoneId.$": "$.hostedZoneId",
+        "Name.$": "$.oldKskName"
+      },
+      "ResultPath": null,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Next": "WaitDnskeyTtl"
+    },
+
+    "WaitDnskeyTtl": {
+      "Type": "Wait",
+      "SecondsPath": "$.dnskeyTtlWaitSeconds",
+      "Comment": "Wait 2× DNSKEY TTL for caches to stop using old key",
+      "Next": "DeleteOldKsk"
+    },
+
+    "DeleteOldKsk": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:route53:deleteKeySigningKey",
+      "Parameters": {
+        "HostedZoneId.$": "$.hostedZoneId",
+        "Name.$": "$.oldKskName"
+      },
+      "ResultPath": null,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Next": "ScheduleOldKmsDeletion"
+    },
+
+    "ScheduleOldKmsDeletion": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:kms:scheduleKeyDeletion",
+      "Parameters": {
+        "KeyId.$": "$.dsRecords.oldKmsArn",
+        "PendingWindowInDays": ${kms_deletion_window_days}
+      },
+      "ResultPath": null,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 2, "BackoffRate": 2 }],
+      "Next": "NotifySuccess"
+    },
+
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+      "Parameters": {
+        "TopicArn": "${sns_topic_arn}",
+        "Subject.$": "States.Format('[DNSSEC] KSK rotation complete for {}', $.zoneName)",
+        "Message.$": "States.Format('KSK rotation completed for {}. Old KSK: {} (deleted). New KSK: {} (active). Old KMS key scheduled for deletion.', $.zoneName, $.oldKskName, $.newKskName)"
+      },
+      "ResultPath": null,
+      "Next": "RotationComplete"
+    },
+
+    "RotationComplete": {
+      "Type": "Succeed"
+    },
+
+    "NotifyValidationFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+      "Parameters": {
+        "TopicArn": "${sns_topic_arn}",
+        "Subject.$": "States.Format('[DNSSEC] ALERT: Validation failed for {}', $.zoneName)",
+        "Message.$": "States.Format('KSK rotation validation FAILED for {}. Both KSKs remain active. Manual intervention required. Do NOT remove old DS from parent.', $.zoneName)"
+      },
+      "ResultPath": null,
+      "Next": "RotationFailed"
+    },
+
+    "RotationFailed": {
+      "Type": "Fail",
+      "Error": "ValidationFailed",
+      "Cause": "DNSSEC chain validation failed after DS TTL wait. Both KSKs remain active — manual intervention required."
+    }
+  }
+}

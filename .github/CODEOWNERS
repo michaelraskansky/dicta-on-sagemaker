@@ -1,0 +1,12 @@
+# Infrastructure changes require review
+**/infra/ @michaelraskansky
+**/*.tf @michaelraskansky
+**/*.asl.json @michaelraskansky
+
+# Lambda code
+**/lambda/ @michaelraskansky
+
+# CI/CD and security config
+.github/ @michaelraskansky
+.gitleaks.toml @michaelraskansky
+.gitignore @michaelraskansky

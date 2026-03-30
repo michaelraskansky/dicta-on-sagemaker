@@ -10,6 +10,7 @@ A collection of self-contained demos showing how to deploy and run things on AWS
 | [dicta-thinking](sagemaker/dicta-thinking/) | SageMaker | Deploy a 24B reasoning model (DictaLM-3.0-Thinking) with DJL/vLLM |
 | [dicta-nemotron](sagemaker/dicta-nemotron/) | SageMaker | Deploy a 12B instruction model (DictaLM-3.0-Nemotron) with DJL/vLLM |
 | [genai-loft-demo](agentcore/genai-loft-demo/) | AgentCore | Bedrock AgentCore agents with memory, shared tools, and gateway |
+| [r53mgmt](route53/r53mgmt/) | Route 53 | DNS management dashboard with DNSSEC KSK rotation and child zone creation via Step Functions |
 
 ## Structure
 
@@ -20,6 +21,8 @@ A collection of self-contained demos showing how to deploy and run things on AWS
 │   └── dicta-nemotron/     # 12B LLM on DJL/vLLM
 ├── agentcore/
 │   └── genai-loft-demo/    # AgentCore agents workshop
+├── route53/
+│   └── r53mgmt/            # DNS management + DNSSEC rotation dashboard
 └── ...                     # more service categories as demos are added
 ```
 

@@ -1,0 +1,15 @@
+.superpowers/
+docs/superpowers/
+node_modules/
+dist/
+.env
+*.local
+.DS_Store
+infra/.terraform/
+infra/*.tfstate*
+infra/tfplan
+infra/*.tfplan
+infra/.terraform.lock.hcl
+infra/lambda/validate-chain/node_modules/
+infra/lambda/validate-chain/dist/
+infra/lambda/*.zip
