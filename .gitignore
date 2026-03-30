@@ -21,6 +21,19 @@ uv.lock
 # SageMaker artifacts
 endpoint_config.json
 
+# Node.js
+node_modules/
+dist/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+
+# Lambda build artifacts
+*.zip
+
 # Secrets (should never be committed)
 *.pem
 *.key

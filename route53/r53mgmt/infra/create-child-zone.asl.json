@@ -1,0 +1,137 @@
+{
+  "Comment": "Create child hosted zone with NS delegation. Managed parent: auto-adds NS records. Unmanaged parent: pauses for manual NS addition via SNS task token.",
+  "StartAt": "CreateHostedZone",
+  "States": {
+
+    "CreateHostedZone": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:route53:createHostedZone",
+      "Parameters": {
+        "Name.$": "$.childZoneName",
+        "CallerReference.$": "$$.Execution.Name",
+        "HostedZoneConfig": {
+          "Comment.$": "States.Format('Child zone created by r53mgmt. {}', $.comment)"
+        }
+      },
+      "ResultPath": "$.createResult",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "ResultPath": "$.error",
+        "Next": "NotifyFailure"
+      }],
+      "Next": "GetHostedZone"
+    },
+
+    "GetHostedZone": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:route53:getHostedZone",
+      "Parameters": {
+        "Id.$": "$.createResult.HostedZone.Id"
+      },
+      "ResultPath": "$.zoneDetail",
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "ResultPath": "$.error",
+        "Next": "NotifyFailure"
+      }],
+      "Next": "HasManagedParent"
+    },
+
+    "HasManagedParent": {
+      "Type": "Choice",
+      "Choices": [{
+        "And": [
+          { "Variable": "$.parentZoneId", "IsPresent": true },
+          { "Variable": "$.parentZoneId", "IsNull": false }
+        ],
+        "Next": "AddNsToParent"
+      }],
+      "Default": "NotifyManualNs"
+    },
+
+    "AddNsToParent": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:route53:changeResourceRecordSets",
+      "Parameters": {
+        "HostedZoneId.$": "$.parentZoneId",
+        "ChangeBatch": {
+          "Comment.$": "States.Format('NS delegation for child zone {}', $.childZoneName)",
+          "Changes": [{
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+              "Name.$": "$.childZoneName",
+              "Type": "NS",
+              "Ttl": 172800,
+              "ResourceRecords": [
+                { "Value.$": "$.zoneDetail.DelegationSet.NameServers[0]" },
+                { "Value.$": "$.zoneDetail.DelegationSet.NameServers[1]" },
+                { "Value.$": "$.zoneDetail.DelegationSet.NameServers[2]" },
+                { "Value.$": "$.zoneDetail.DelegationSet.NameServers[3]" }
+              ]
+            }
+          }]
+        }
+      },
+      "ResultPath": null,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 2, "BackoffRate": 2 }],
+      "Catch": [{
+        "ErrorEquals": ["States.ALL"],
+        "ResultPath": "$.error",
+        "Next": "NotifyFailure"
+      }],
+      "Next": "NotifySuccess"
+    },
+
+    "NotifyManualNs": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish.waitForTaskToken",
+      "Parameters": {
+        "TopicArn": "${sns_topic_arn}",
+        "Subject.$": "States.Format('[DNS] Action required: Add NS records for {}', $.childZoneName)",
+        "Message.$": "States.Format('Child zone {} created.\n\nAdd these NS records to the parent zone:\n  {}\n  {}\n  {}\n  {}\n\nWhen done, approve in the r53mgmt UI or run:\naws stepfunctions send-task-success --task-token \"{}\" --task-output \"{{}}\"', $.childZoneName, $.zoneDetail.DelegationSet.NameServers[0], $.zoneDetail.DelegationSet.NameServers[1], $.zoneDetail.DelegationSet.NameServers[2], $.zoneDetail.DelegationSet.NameServers[3], $$.Task.Token)"
+      },
+      "HeartbeatSeconds": 604800,
+      "ResultPath": null,
+      "Catch": [{
+        "ErrorEquals": ["States.Timeout"],
+        "ResultPath": "$.error",
+        "Next": "NotifyFailure"
+      }],
+      "Next": "NotifySuccess"
+    },
+
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+      "Parameters": {
+        "TopicArn": "${sns_topic_arn}",
+        "Subject.$": "States.Format('[DNS] Child zone created: {}', $.childZoneName)",
+        "Message.$": "States.Format('Child zone {} created successfully.\n\nZone ID: {}\nNameservers:\n  {}\n  {}\n  {}\n  {}', $.childZoneName, $.createResult.HostedZone.Id, $.zoneDetail.DelegationSet.NameServers[0], $.zoneDetail.DelegationSet.NameServers[1], $.zoneDetail.DelegationSet.NameServers[2], $.zoneDetail.DelegationSet.NameServers[3])"
+      },
+      "ResultPath": null,
+      "Next": "CreationComplete"
+    },
+
+    "CreationComplete": {
+      "Type": "Succeed"
+    },
+
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+      "Parameters": {
+        "TopicArn": "${sns_topic_arn}",
+        "Subject.$": "States.Format('[DNS] FAILED: Child zone creation for {}', $.childZoneName)",
+        "Message.$": "States.Format('Child zone creation failed for {}. Check the Step Functions execution for details.', $.childZoneName)"
+      },
+      "ResultPath": null,
+      "Next": "CreationFailed"
+    },
+
+    "CreationFailed": {
+      "Type": "Fail",
+      "Error": "ChildZoneCreationFailed",
+      "Cause": "Child zone creation failed — see execution history for details."
+    }
+  }
+}
